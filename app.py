@@ -10,6 +10,8 @@ from flask import Flask, Response, jsonify, redirect, request
 
 app = Flask(__name__)
 
+APP_VERSION = "process_false_v3_2026_06_18"
+
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CACHE = {}
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "900"))
@@ -97,6 +99,7 @@ def yt_dlp_opts(mode: str = "ps3") -> dict:
         "noplaylist": True,
         "skip_download": True,
         "socket_timeout": REQUEST_TIMEOUT,
+        "ignore_no_formats_error": True,
         "http_headers": {
             "User-Agent": USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9",
@@ -222,7 +225,7 @@ def extract_mp4(video_id: str, mode: str = "ps3", force: bool = False) -> dict:
         raise ValueError("ID inválido")
 
     mode = "pc" if mode == "pc" else "ps3"
-    cache_key = f"{video_id}:{mode}:format_fallback_v2"
+    cache_key = f"{video_id}:{mode}:process_false_v3"
 
     if not force:
         cached = cache_get(cache_key)
@@ -234,7 +237,7 @@ def extract_mp4(video_id: str, mode: str = "ps3", force: bool = False) -> dict:
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
 
     with yt_dlp.YoutubeDL(yt_dlp_opts(mode)) as ydl:
-        info = ydl.extract_info(watch_url, download=False)
+        info = ydl.extract_info(watch_url, download=False, process=False)
 
     selected, scored = pick_best_progressive_format(info, mode)
 
@@ -302,7 +305,7 @@ def list_formats_for_debug(video_id: str, mode: str = "ps3") -> dict:
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
 
     with yt_dlp.YoutubeDL(yt_dlp_opts(mode)) as ydl:
-        info = ydl.extract_info(watch_url, download=False)
+        info = ydl.extract_info(watch_url, download=False, process=False)
 
     rows = []
     for f in info.get("formats") or []:
@@ -350,7 +353,7 @@ def index():
   </style>
 </head>
 <body>
-  <h1>yt-dlp External Extractor</h1>
+  <h1>yt-dlp External Extractor</h1>\n  <p>Version: process_false_v3_2026_06_18</p>
   <div class="box">
     <form action="/direct" method="get">
       <input name="v" value="7H6swK9OHC0" maxlength="11" placeholder="YouTube ID">
@@ -368,7 +371,7 @@ def index():
   </div>
   <div class="box">
     <p>Endpoints:</p>
-    <p><code>/extract/7H6swK9OHC0?mode=ps3</code></p>\n    <p><code>/formats/7H6swK9OHC0?mode=ps3</code></p>
+    <p><code>/extract/7H6swK9OHC0?mode=ps3</code></p>\n    <p><code>/formats/7H6swK9OHC0?mode=ps3</code></p>\n    <p><code>/raw/7H6swK9OHC0?mode=ps3</code></p>\n    <p><code>/version</code></p>
     <p><code>/direct?v=7H6swK9OHC0&mode=pc</code></p>
     <p><code>/proxy?v=7H6swK9OHC0&mode=ps3</code></p>
     <p><code>/player?v=7H6swK9OHC0</code></p>
@@ -390,9 +393,15 @@ def health():
     return jsonify({
         "ok": True,
         "service": "yt-dlp-extractor",
+        "version": APP_VERSION,
         "cache_items": len(CACHE),
         "has_cookies": has_cookies
     })
+
+
+@app.get("/version")
+def version():
+    return jsonify({"ok": True, "version": APP_VERSION})
 
 
 @app.get("/extract/<video_id>")
@@ -415,6 +424,46 @@ def formats_route(video_id):
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "id": video_id}), 500
 
+
+
+
+@app.get("/raw/<video_id>")
+def raw_route(video_id):
+    mode = request.args.get("mode", "ps3")
+
+    try:
+        if not valid_video_id(video_id):
+            raise ValueError("ID inválido")
+
+        mode = "pc" if mode == "pc" else "ps3"
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+
+        with yt_dlp.YoutubeDL(yt_dlp_opts(mode)) as ydl:
+            info = ydl.extract_info(watch_url, download=False, process=False)
+
+        formats = info.get("formats") or []
+        return jsonify({
+            "ok": True,
+            "version": APP_VERSION,
+            "id": video_id,
+            "title": info.get("title") or "",
+            "formats_count": len(formats),
+            "top_keys": sorted(list(info.keys()))[:80],
+            "first_formats": [
+                {
+                    "format_id": f.get("format_id"),
+                    "ext": f.get("ext"),
+                    "height": f.get("height"),
+                    "vcodec": f.get("vcodec"),
+                    "acodec": f.get("acodec"),
+                    "protocol": f.get("protocol"),
+                    "has_url": bool(f.get("url")),
+                }
+                for f in formats[:25]
+            ]
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "version": APP_VERSION, "error": str(e), "id": video_id}), 500
 
 @app.get("/direct")
 def direct_route():

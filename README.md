@@ -104,3 +104,21 @@ Novo endpoint de debug:
 `/formats/7H6swK9OHC0?mode=ps3`
 
 Use ele se `/extract` disser que nenhum progressivo apareceu.
+
+
+## Versão process_false_v3
+
+Se ainda aparecer `Requested format is not available`, essa versão usa:
+
+```python
+ydl.extract_info(url, download=False, process=False)
+```
+
+Isso evita o yt-dlp abortar na seleção automática de formato antes do app listar os formatos.
+
+Teste depois do redeploy:
+
+- `/version` deve retornar `process_false_v3_2026_06_18`
+- `/raw/7H6swK9OHC0?mode=ps3`
+- `/formats/7H6swK9OHC0?mode=ps3`
+- `/extract/7H6swK9OHC0?mode=ps3&force=1`
