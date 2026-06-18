@@ -86,16 +86,12 @@ def ensure_cookiefile_from_env():
 
 
 def yt_dlp_opts(mode: str = "ps3") -> dict:
-    # PS3/Flash gosta de MP4 progressivo com vídeo+áudio juntos.
-    # itag 18 = 360p MP4 H.264 + AAC, geralmente o mais compatível.
-    # itag 22 = 720p MP4 H.264 + AAC, melhor para PC mas pode pesar no PS3.
-    if mode == "pc":
-        fmt = "22/18/best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]/best[height<=720]/best"
-    else:
-        fmt = "18/22/best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]/best[height<=720]/best"
-
+    # Importante:
+    # Não forçamos "format" aqui.
+    # Se colocar "22/18/..." direto no yt-dlp, ele pode abortar com:
+    # "Requested format is not available"
+    # antes do nosso fallback manual rodar.
     opts = {
-        "format": fmt,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -104,6 +100,12 @@ def yt_dlp_opts(mode: str = "ps3") -> dict:
         "http_headers": {
             "User-Agent": USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9",
+        },
+        "extractor_args": {
+            "youtube": {
+                # Ajuda em alguns casos a expor formatos que o cliente padrão não mostra.
+                "player_client": ["web", "mweb", "android"],
+            }
         },
     }
 
@@ -116,12 +118,111 @@ def yt_dlp_opts(mode: str = "ps3") -> dict:
     return opts
 
 
+def format_score(f: dict, mode: str = "ps3") -> int:
+    url = f.get("url") or ""
+    if not url:
+        return -1
+
+    ext = (f.get("ext") or "").lower()
+    acodec = f.get("acodec") or "none"
+    vcodec = f.get("vcodec") or "none"
+    height = f.get("height") or 0
+    format_id = str(f.get("format_id") or "")
+    protocol = (f.get("protocol") or "").lower()
+    mime = (f.get("mime_type") or "").lower()
+    fps = f.get("fps") or 0
+
+    # Para PS3/Flash, o ideal é progressivo: vídeo+áudio no mesmo MP4.
+    # DASH separado não serve para "fichier=".
+    if acodec == "none" or vcodec == "none":
+        return -1
+
+    # Evita storyboard/imagem/etc.
+    if ext in ("mhtml", "jpg", "png", "webp"):
+        return -1
+
+    s = 0
+
+    # MP4 progressivo é rei.
+    if ext == "mp4":
+        s += 300
+    if "mp4" in mime:
+        s += 80
+    if "avc1" in str(vcodec):
+        s += 90
+    if "mp4a" in str(acodec):
+        s += 90
+
+    # Evita HLS/DASH para PS3, mas deixa como último fallback para PC.
+    if protocol in ("https", "http"):
+        s += 80
+    elif "m3u8" in protocol:
+        s += 10 if mode == "pc" else -200
+    elif "dash" in protocol:
+        s -= 200
+
+    # Formatos clássicos do YouTube.
+    if format_id == "18":
+        s += 500 if mode == "ps3" else 220
+    elif format_id == "22":
+        s += 420 if mode == "pc" else 180
+
+    if height:
+        if mode == "ps3":
+            # PS3 Flash: 360p costuma ser mais seguro.
+            if height <= 360:
+                s += 180
+            elif height <= 480:
+                s += 100
+            elif height <= 720:
+                s += 40
+            else:
+                s -= 200
+            s -= abs(height - 360) // 4
+        else:
+            # PC: 720p ok.
+            if height <= 720:
+                s += 160
+            else:
+                s -= 80
+            s -= abs(height - 720) // 8
+
+    # 60fps pode pesar no PS3.
+    if mode == "ps3" and fps and fps > 30:
+        s -= 80
+
+    return s
+
+
+def pick_best_progressive_format(info: dict, mode: str = "ps3"):
+    formats = info.get("formats") or []
+    scored = []
+
+    for f in formats:
+        s = format_score(f, mode)
+        if s >= 0:
+            scored.append((s, f))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    if scored:
+        return scored[0][1], scored
+
+    # Fallback final para PC: qualquer URL tocável.
+    if mode == "pc":
+        any_url = [f for f in formats if f.get("url") and (f.get("vcodec") or "none") != "none"]
+        if any_url:
+            return any_url[-1], []
+
+    return None, scored
+
+
 def extract_mp4(video_id: str, mode: str = "ps3", force: bool = False) -> dict:
     if not valid_video_id(video_id):
         raise ValueError("ID inválido")
 
     mode = "pc" if mode == "pc" else "ps3"
-    cache_key = f"{video_id}:{mode}"
+    cache_key = f"{video_id}:{mode}:format_fallback_v2"
 
     if not force:
         cached = cache_get(cache_key)
@@ -135,65 +236,100 @@ def extract_mp4(video_id: str, mode: str = "ps3", force: bool = False) -> dict:
     with yt_dlp.YoutubeDL(yt_dlp_opts(mode)) as ydl:
         info = ydl.extract_info(watch_url, download=False)
 
-    # info["url"] normalmente vem quando o formato escolhido é único/progressivo.
-    media_url = info.get("url")
-    fmt = info.get("format_id") or info.get("format") or ""
+    selected, scored = pick_best_progressive_format(info, mode)
 
+    if not selected:
+        available = []
+        for f in (info.get("formats") or [])[:80]:
+            available.append({
+                "format_id": f.get("format_id"),
+                "ext": f.get("ext"),
+                "height": f.get("height"),
+                "vcodec": f.get("vcodec"),
+                "acodec": f.get("acodec"),
+                "protocol": f.get("protocol"),
+            })
+
+        raise RuntimeError(
+            "Nenhum formato progressivo com vídeo+áudio foi encontrado. "
+            "Abra /formats/%s?mode=%s para ver formatos disponíveis. "
+            "Primeiros formatos: %s" % (video_id, mode, available[:12])
+        )
+
+    media_url = selected.get("url")
     if not media_url:
-        # Fallback defensivo: procura formato progressivo MP4 manualmente.
-        formats = info.get("formats") or []
-
-        def score(f):
-            url = f.get("url") or ""
-            ext = f.get("ext") or ""
-            acodec = f.get("acodec") or "none"
-            vcodec = f.get("vcodec") or "none"
-            height = f.get("height") or 0
-            format_id = str(f.get("format_id") or "")
-
-            if not url:
-                return -1
-            if acodec == "none" or vcodec == "none":
-                return -1
-
-            s = 0
-            if ext == "mp4":
-                s += 100
-            if "avc1" in vcodec:
-                s += 50
-            if "mp4a" in acodec:
-                s += 50
-            if format_id == "18":
-                s += 200 if mode == "ps3" else 120
-            if format_id == "22":
-                s += 160 if mode == "pc" else 80
-            if height and height <= 720:
-                s += max(0, 80 - abs(height - (360 if mode == "ps3" else 720)) // 10)
-            return s
-
-        candidates = sorted(formats, key=score, reverse=True)
-        if candidates and score(candidates[0]) >= 0:
-            best = candidates[0]
-            media_url = best.get("url")
-            fmt = best.get("format_id") or best.get("format") or fmt
-
-    if not media_url:
-        raise RuntimeError("yt-dlp não retornou URL progressiva")
+        raise RuntimeError("Formato escolhido não tem URL")
 
     result = {
         "id": video_id,
         "title": info.get("title") or "",
         "url": media_url,
-        "format": fmt,
+        "format": selected.get("format_id") or selected.get("format") or "",
+        "ext": selected.get("ext"),
+        "height": selected.get("height"),
+        "width": selected.get("width"),
+        "vcodec": selected.get("vcodec"),
+        "acodec": selected.get("acodec"),
+        "protocol": selected.get("protocol"),
         "mode": mode,
         "duration": info.get("duration"),
         "thumbnail": info.get("thumbnail"),
         "cache": False,
         "created_at": int(time.time()),
+        "available_progressive": [
+            {
+                "score": s,
+                "format_id": f.get("format_id"),
+                "ext": f.get("ext"),
+                "height": f.get("height"),
+                "vcodec": f.get("vcodec"),
+                "acodec": f.get("acodec"),
+                "protocol": f.get("protocol"),
+            }
+            for s, f in scored[:10]
+        ],
     }
 
     cache_set(cache_key, result)
     return result
+
+
+def list_formats_for_debug(video_id: str, mode: str = "ps3") -> dict:
+    if not valid_video_id(video_id):
+        raise ValueError("ID inválido")
+
+    mode = "pc" if mode == "pc" else "ps3"
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    with yt_dlp.YoutubeDL(yt_dlp_opts(mode)) as ydl:
+        info = ydl.extract_info(watch_url, download=False)
+
+    rows = []
+    for f in info.get("formats") or []:
+        rows.append({
+            "score": format_score(f, mode),
+            "format_id": f.get("format_id"),
+            "format_note": f.get("format_note"),
+            "ext": f.get("ext"),
+            "width": f.get("width"),
+            "height": f.get("height"),
+            "fps": f.get("fps"),
+            "vcodec": f.get("vcodec"),
+            "acodec": f.get("acodec"),
+            "protocol": f.get("protocol"),
+            "filesize": f.get("filesize") or f.get("filesize_approx"),
+            "has_url": bool(f.get("url")),
+        })
+
+    rows.sort(key=lambda x: x["score"], reverse=True)
+
+    return {
+        "id": video_id,
+        "title": info.get("title") or "",
+        "mode": mode,
+        "formats_count": len(rows),
+        "best_candidates": rows[:40],
+    }
 
 
 @app.get("/")
@@ -232,7 +368,7 @@ def index():
   </div>
   <div class="box">
     <p>Endpoints:</p>
-    <p><code>/extract/7H6swK9OHC0?mode=ps3</code></p>
+    <p><code>/extract/7H6swK9OHC0?mode=ps3</code></p>\n    <p><code>/formats/7H6swK9OHC0?mode=ps3</code></p>
     <p><code>/direct?v=7H6swK9OHC0&mode=pc</code></p>
     <p><code>/proxy?v=7H6swK9OHC0&mode=ps3</code></p>
     <p><code>/player?v=7H6swK9OHC0</code></p>
@@ -266,6 +402,16 @@ def extract_route(video_id):
 
     try:
         return jsonify(extract_mp4(video_id, mode=mode, force=force))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "id": video_id}), 500
+
+
+@app.get("/formats/<video_id>")
+def formats_route(video_id):
+    mode = request.args.get("mode", "ps3")
+
+    try:
+        return jsonify(list_formats_for_debug(video_id, mode=mode))
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "id": video_id}), 500
 

@@ -89,3 +89,18 @@ Depois cole no Railway como valor de `YTDLP_COOKIES_B64`.
 
 Cookies equivalem a sessão/login. Use conta secundária do YouTube/Google, não a principal.
 Não poste cookies em chat, print, GitHub ou logs.
+
+
+## Fix "Requested format is not available"
+
+Esta versão não força mais `22/18/...` dentro do yt-dlp logo de cara.
+Ela primeiro deixa o yt-dlp listar os formatos, depois o app escolhe manualmente:
+
+- PS3: prioriza itag 18, MP4, avc1 + mp4a, progressivo.
+- PC: prioriza itag 22/720p, mas cai para outros progressivos.
+
+Novo endpoint de debug:
+
+`/formats/7H6swK9OHC0?mode=ps3`
+
+Use ele se `/extract` disser que nenhum progressivo apareceu.
