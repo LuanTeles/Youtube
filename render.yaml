@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: yt-dlp-extractor
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: CACHE_TTL_SECONDS
+        value: "900"
+      - key: REQUEST_TIMEOUT
+        value: "30"
