@@ -1,124 +1,60 @@
-# yt-dlp External Extractor para Railway/Render
+# Railway Classic Auto Compat
 
-Use apenas com vídeos seus, conteúdo livre, ou conteúdo que você tem direito de acessar/preservar.
+Esta versão foi feita para encaixar direto no código classic da loja.
+
+O classic faz:
+1. YouTube Data API busca o videoId pelo nome do jogo.
+2. PS3 chama: YOUTUBE_PS3_WORKER + '/video/' + videoId + '.mp4'
+3. Este Railway responde esse endpoint e tenta extrair MP4 automaticamente.
 
 ## Endpoints
 
-- `/extract/<video_id>?mode=ps3`
-  Retorna JSON com URL MP4 progressiva.
-- `/direct?v=<video_id>&mode=pc`
-  Redireciona o PC para a URL real.
-- `/proxy?v=<video_id>&mode=ps3`
-  Faz proxy com Range para PS3/Flash.
-- `/player?v=<video_id>`
-  Abre player Flash usando `/proxy`.
-- `/health`
-  Teste do serviço.
+- `/video/VIDEO_ID.mp4`
+  Endpoint compatível com o classic antigo.
 
-## Modo
+- `/watch?v=VIDEO_ID&direct=1`
+  Redireciona PC para MP4 real.
 
-- `mode=ps3`: prioriza itag 18, MP4 360p progressivo.
-- `mode=pc`: prioriza itag 22, MP4 720p progressivo.
+- `/watch?v=VIDEO_ID`
+  Proxy do vídeo.
 
-## Deploy Railway
+- `/extract/VIDEO_ID?mode=ps3`
+  JSON com URL extraída.
 
-1. Crie um projeto no GitHub com estes arquivos.
-2. Railway > New Project > Deploy from GitHub.
-3. Start command:
-   `gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120`
+- `/debug?v=VIDEO_ID&mode=ps3&force=1`
+  Mostra todas as tentativas.
 
-## Deploy Render
+- `/player?v=VIDEO_ID`
+  Player Flash de teste.
 
-1. New Web Service.
-2. Runtime Python.
-3. Build command:
-   `pip install -r requirements.txt`
-4. Start command:
-   `gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120`
+## Ordem de extração automática
 
-## Observações
+1. Invidious API `/api/v1/videos/ID`
+2. Invidious watch HTML `/watch?v=ID`
+3. yt-dlp com cookies, se configurado
 
-- Render Free pode dormir após inatividade; a primeira chamada pode demorar.
-- Railway não tem plano grátis permanente; Hobby tem mínimo mensal.
-- YouTube pode exigir PO Token/cookies em alguns casos. Este projeto não burla isso; só usa yt-dlp normalmente.
+## Variáveis Railway
 
-
-## Fix Railway mise Python attestations
-
-Se o build falhar com:
-
-`No GitHub artifact attestations found for python@3.11.9`
-
-No Railway > Variables, adicione:
+Obrigatória se der erro do mise:
 
 `MISE_PYTHON_GITHUB_ATTESTATIONS=false`
 
-Este ZIP também inclui `mise.toml`:
+Opcional para yt-dlp:
 
-```toml
-[settings]
-python.github_attestations = false
-```
+`YTDLP_COOKIES_B64=<cookies.txt em base64>`
 
-Depois faça Redeploy.
+Opcional para trocar instâncias:
 
+`INVIDIOUS_INSTANCES=https://inv.nadeko.net,https://invidious.f5.si`
 
-## YouTube pedindo "Sign in to confirm you're not a bot"
+## Patch no classic
 
-Se `/extract/ID` retornar erro pedindo cookies, use variável de ambiente no Railway.
+Troque:
 
-### Variável recomendada
+`var YOUTUBE_PS3_WORKER = "http://youtube.ps3-pro.workers.dev";`
 
-No Railway > Variables:
+por:
 
-`YTDLP_COOKIES_B64=<seu cookies.txt em base64>`
+`var YOUTUBE_PS3_WORKER = "https://web-production-e2a34.up.railway.app";`
 
-O app vai escrever isso em `/tmp/youtube_cookies.txt` e passar para o yt-dlp.
-
-### Como gerar base64 no Windows PowerShell
-
-Com `cookies.txt` na pasta atual:
-
-```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt")) | Set-Clipboard
-```
-
-Depois cole no Railway como valor de `YTDLP_COOKIES_B64`.
-
-### Segurança
-
-Cookies equivalem a sessão/login. Use conta secundária do YouTube/Google, não a principal.
-Não poste cookies em chat, print, GitHub ou logs.
-
-
-## Fix "Requested format is not available"
-
-Esta versão não força mais `22/18/...` dentro do yt-dlp logo de cara.
-Ela primeiro deixa o yt-dlp listar os formatos, depois o app escolhe manualmente:
-
-- PS3: prioriza itag 18, MP4, avc1 + mp4a, progressivo.
-- PC: prioriza itag 22/720p, mas cai para outros progressivos.
-
-Novo endpoint de debug:
-
-`/formats/7H6swK9OHC0?mode=ps3`
-
-Use ele se `/extract` disser que nenhum progressivo apareceu.
-
-
-## Versão process_false_v3
-
-Se ainda aparecer `Requested format is not available`, essa versão usa:
-
-```python
-ydl.extract_info(url, download=False, process=False)
-```
-
-Isso evita o yt-dlp abortar na seleção automática de formato antes do app listar os formatos.
-
-Teste depois do redeploy:
-
-- `/version` deve retornar `process_false_v3_2026_06_18`
-- `/raw/7H6swK9OHC0?mode=ps3`
-- `/formats/7H6swK9OHC0?mode=ps3`
-- `/extract/7H6swK9OHC0?mode=ps3&force=1`
+Depois o botão Trailer do classic deve continuar usando `/video/ID.mp4`.

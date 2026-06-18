@@ -1,8 +1,9 @@
 import base64
+import html
 import os
 import re
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import requests
 import yt_dlp
@@ -10,7 +11,7 @@ from flask import Flask, Response, jsonify, redirect, request
 
 app = Flask(__name__)
 
-APP_VERSION = "process_false_v3_2026_06_18"
+APP_VERSION = "classic_auto_compat_v1_2026_06_18"
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CACHE = {}
@@ -19,9 +20,34 @@ REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
 
 USER_AGENT = os.environ.get(
     "USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126 Safari/537.36"
 )
+
+DEFAULT_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.tiekoetter.com",
+    "https://invidious.f5.si",
+    "https://inv.thepixora.com",
+    "https://yt.chocolatemoo53.com",
+    "https://iv.datura.network",
+    "https://iv.nboeck.de",
+    "https://iv.melmac.space",
+    "https://vid.puffyan.us",
+]
+
+
+def get_instances():
+    raw = os.environ.get("INVIDIOUS_INSTANCES", "").strip()
+    if not raw:
+        return DEFAULT_INSTANCES
+
+    items = []
+    for part in raw.split(","):
+        part = part.strip().rstrip("/")
+        if part:
+            items.append(part)
+    return items or DEFAULT_INSTANCES
 
 
 def valid_video_id(video_id: str) -> bool:
@@ -48,13 +74,6 @@ def cache_set(key: str, data: dict):
 
 
 def ensure_cookiefile_from_env():
-    """
-    Railway não é bom para subir arquivo cookies.txt manual.
-    Então aceitamos:
-    - YTDLP_COOKIES_FILE: caminho para arquivo já existente
-    - YTDLP_COOKIES_B64: cookies.txt em base64
-    - YTDLP_COOKIES_RAW: conteúdo bruto do cookies.txt
-    """
     cookiefile = os.environ.get("YTDLP_COOKIES_FILE")
     if cookiefile and os.path.exists(cookiefile):
         return cookiefile
@@ -75,11 +94,6 @@ def ensure_cookiefile_from_env():
     else:
         content = raw.replace("\\n", "\n")
 
-    if "# Netscape HTTP Cookie File" not in content:
-        # yt-dlp espera formato Netscape cookies.txt.
-        # Não bloqueia, mas avisa pelo erro do yt-dlp se estiver errado.
-        pass
-
     with open(target, "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -87,12 +101,221 @@ def ensure_cookiefile_from_env():
     return target
 
 
+def base_headers():
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/json,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+
+def safe_json_response(data, status=200):
+    return jsonify(data), status
+
+
+def score_media_url(url: str, mode: str) -> int:
+    u = (url or "").lower()
+    if not u:
+        return -1
+
+    s = 0
+
+    if "itag=18" in u or "itag%3d18" in u:
+        s += 500 if mode == "ps3" else 250
+    if "itag=22" in u or "itag%3d22" in u:
+        s += 420 if mode == "pc" else 150
+
+    if "mime=video%2fmp4" in u or "mime=video/mp4" in u or "type=video/mp4" in u:
+        s += 250
+    if "/companion/latest_version" in u or "/latest_version" in u:
+        s += 220
+    if "/videoplayback" in u or "googlevideo.com/videoplayback" in u:
+        s += 200
+    if "ratebypass=yes" in u:
+        s += 70
+    if "check=" in u:
+        s += 80
+
+    if ".m3u8" in u or "manifest" in u or "dash" in u:
+        s -= 300
+
+    return s
+
+
+def pick_best_stream(streams, mode):
+    if not streams:
+        return None
+
+    def stream_score(f):
+        itag = str(f.get("itag") or f.get("format_id") or "")
+        url = f.get("url") or ""
+        ext = (f.get("container") or f.get("ext") or "").lower()
+        quality = (f.get("qualityLabel") or f.get("quality") or "").lower()
+        mime = (f.get("type") or f.get("mimeType") or "").lower()
+
+        s = score_media_url(url, mode)
+
+        if itag == "18":
+            s += 500 if mode == "ps3" else 250
+        elif itag == "22":
+            s += 420 if mode == "pc" else 160
+
+        if "mp4" in ext or "mp4" in mime:
+            s += 200
+        if "360" in quality:
+            s += 180 if mode == "ps3" else 60
+        if "720" in quality:
+            s += 180 if mode == "pc" else 50
+
+        return s
+
+    candidates = [f for f in streams if f.get("url")]
+    if not candidates:
+        return None
+
+    candidates.sort(key=stream_score, reverse=True)
+    return candidates[0]
+
+
+def extract_from_invidious_api(video_id, mode, attempts):
+    for base in get_instances():
+        api_url = f"{base.rstrip('/')}/api/v1/videos/{video_id}"
+
+        try:
+            r = requests.get(api_url, headers=base_headers(), timeout=REQUEST_TIMEOUT)
+            attempts.append({
+                "method": "invidious_api",
+                "url": api_url,
+                "status": r.status_code,
+                "type": r.headers.get("content-type", ""),
+                "length": len(r.text or ""),
+            })
+
+            if r.status_code != 200:
+                continue
+
+            data = r.json()
+            streams = data.get("formatStreams") or data.get("adaptiveFormats") or []
+            best = pick_best_stream(streams, mode)
+
+            if best and best.get("url"):
+                return {
+                    "id": video_id,
+                    "title": data.get("title") or "",
+                    "url": best["url"],
+                    "format": str(best.get("itag") or ""),
+                    "quality": best.get("qualityLabel") or best.get("quality") or "",
+                    "source": "invidious_api",
+                    "instance": base,
+                    "mode": mode,
+                }
+        except Exception as e:
+            attempts.append({
+                "method": "invidious_api",
+                "url": api_url,
+                "error": str(e),
+            })
+
+    return None
+
+
+def find_urls_in_html(page_html, base_url, mode):
+    found = []
+
+    # <source src="...">
+    for m in re.finditer(r"<source\b[^>]*\bsrc=[\"']([^\"']+)[\"'][^>]*>", page_html, re.I):
+        tag = m.group(0)
+        src = html.unescape(m.group(1))
+        full = urljoin(base_url, src)
+        found.append({
+            "url": full,
+            "kind": "source",
+            "score": score_media_url(full + " " + tag, mode)
+        })
+
+    # <meta property="og:video..." content="...">
+    for m in re.finditer(r"<meta\b[^>]*(?:property|name)=[\"'](?:og:video(?::url|:secure_url)?|twitter:player)[\"'][^>]*\bcontent=[\"']([^\"']+)[\"'][^>]*>", page_html, re.I):
+        src = html.unescape(m.group(1))
+        full = urljoin(base_url, src)
+        found.append({
+            "url": full,
+            "kind": "meta",
+            "score": score_media_url(full, mode)
+        })
+
+    # Links diretos escapados no HTML.
+    for m in re.finditer(r"""((?:https?:)?//[^"'<>\s]+/(?:companion/)?latest_version\?[^"'<>\s]+|(?:https?:)?//[^"'<>\s]+/videoplayback\?[^"'<>\s]+|/(?:companion/)?latest_version\?[^"'<>\s]+|/videoplayback\?[^"'<>\s]+)""", page_html, re.I):
+        src = html.unescape(m.group(1)).replace("&amp;", "&")
+        full = urljoin(base_url, src)
+        found.append({
+            "url": full,
+            "kind": "raw",
+            "score": score_media_url(full, mode)
+        })
+
+    # Remove duplicados preservando melhor score.
+    by_url = {}
+    for item in found:
+        u = item["url"]
+        if not u:
+            continue
+        if u not in by_url or item["score"] > by_url[u]["score"]:
+            by_url[u] = item
+
+    result = list(by_url.values())
+    result.sort(key=lambda x: x["score"], reverse=True)
+    return result
+
+
+def extract_from_invidious_watch(video_id, mode, attempts):
+    for base in get_instances():
+        watch_url = f"{base.rstrip('/')}/watch?v={video_id}"
+
+        try:
+            r = requests.get(watch_url, headers=base_headers(), timeout=REQUEST_TIMEOUT)
+            text = r.text or ""
+            urls = find_urls_in_html(text, base, mode)
+
+            attempts.append({
+                "method": "invidious_watch",
+                "url": watch_url,
+                "status": r.status_code,
+                "type": r.headers.get("content-type", ""),
+                "length": len(text),
+                "has_source": "<source" in text.lower(),
+                "has_latest": "latest_version" in text,
+                "has_check": "check=" in text,
+                "candidates": len(urls),
+                "top": urls[:3],
+            })
+
+            # Aceita HTML 200 e também alguns 500 que ainda carregam HTML com meta/source.
+            if urls:
+                best = urls[0]
+                if best["score"] >= 0:
+                    return {
+                        "id": video_id,
+                        "title": "",
+                        "url": best["url"],
+                        "format": "auto",
+                        "quality": "auto",
+                        "source": "invidious_watch_" + best["kind"],
+                        "instance": base,
+                        "mode": mode,
+                    }
+        except Exception as e:
+            attempts.append({
+                "method": "invidious_watch",
+                "url": watch_url,
+                "error": str(e),
+            })
+
+    return None
+
+
 def yt_dlp_opts(mode: str = "ps3") -> dict:
-    # Importante:
-    # Não forçamos "format" aqui.
-    # Se colocar "22/18/..." direto no yt-dlp, ele pode abortar com:
-    # "Requested format is not available"
-    # antes do nosso fallback manual rodar.
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -106,14 +329,11 @@ def yt_dlp_opts(mode: str = "ps3") -> dict:
         },
         "extractor_args": {
             "youtube": {
-                # Ajuda em alguns casos a expor formatos que o cliente padrão não mostra.
                 "player_client": ["web", "mweb", "android"],
             }
         },
     }
 
-    # Cookies opcionais.
-    # Útil quando o YouTube exige: "Sign in to confirm you're not a bot".
     cookiefile = ensure_cookiefile_from_env()
     if cookiefile:
         opts["cookiefile"] = cookiefile
@@ -132,39 +352,22 @@ def format_score(f: dict, mode: str = "ps3") -> int:
     height = f.get("height") or 0
     format_id = str(f.get("format_id") or "")
     protocol = (f.get("protocol") or "").lower()
-    mime = (f.get("mime_type") or "").lower()
-    fps = f.get("fps") or 0
 
-    # Para PS3/Flash, o ideal é progressivo: vídeo+áudio no mesmo MP4.
-    # DASH separado não serve para "fichier=".
     if acodec == "none" or vcodec == "none":
         return -1
-
-    # Evita storyboard/imagem/etc.
     if ext in ("mhtml", "jpg", "png", "webp"):
         return -1
 
-    s = 0
+    s = score_media_url(url, mode)
 
-    # MP4 progressivo é rei.
     if ext == "mp4":
         s += 300
-    if "mp4" in mime:
-        s += 80
     if "avc1" in str(vcodec):
         s += 90
     if "mp4a" in str(acodec):
         s += 90
-
-    # Evita HLS/DASH para PS3, mas deixa como último fallback para PC.
     if protocol in ("https", "http"):
         s += 80
-    elif "m3u8" in protocol:
-        s += 10 if mode == "pc" else -200
-    elif "dash" in protocol:
-        s -= 200
-
-    # Formatos clássicos do YouTube.
     if format_id == "18":
         s += 500 if mode == "ps3" else 220
     elif format_id == "22":
@@ -172,7 +375,6 @@ def format_score(f: dict, mode: str = "ps3") -> int:
 
     if height:
         if mode == "ps3":
-            # PS3 Flash: 360p costuma ser mais seguro.
             if height <= 360:
                 s += 180
             elif height <= 480:
@@ -181,171 +383,118 @@ def format_score(f: dict, mode: str = "ps3") -> int:
                 s += 40
             else:
                 s -= 200
-            s -= abs(height - 360) // 4
         else:
-            # PC: 720p ok.
             if height <= 720:
                 s += 160
             else:
                 s -= 80
-            s -= abs(height - 720) // 8
-
-    # 60fps pode pesar no PS3.
-    if mode == "ps3" and fps and fps > 30:
-        s -= 80
 
     return s
 
 
-def pick_best_progressive_format(info: dict, mode: str = "ps3"):
-    formats = info.get("formats") or []
-    scored = []
+def extract_from_ytdlp(video_id, mode, attempts):
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    for f in formats:
-        s = format_score(f, mode)
-        if s >= 0:
-            scored.append((s, f))
+    try:
+        with yt_dlp.YoutubeDL(yt_dlp_opts(mode)) as ydl:
+            info = ydl.extract_info(watch_url, download=False, process=False)
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+        formats = info.get("formats") or []
+        candidates = []
 
-    if scored:
-        return scored[0][1], scored
+        for f in formats:
+            s = format_score(f, mode)
+            if s >= 0:
+                candidates.append((s, f))
 
-    # Fallback final para PC: qualquer URL tocável.
-    if mode == "pc":
-        any_url = [f for f in formats if f.get("url") and (f.get("vcodec") or "none") != "none"]
-        if any_url:
-            return any_url[-1], []
+        candidates.sort(key=lambda x: x[0], reverse=True)
 
-    return None, scored
+        attempts.append({
+            "method": "yt_dlp",
+            "formats_count": len(formats),
+            "usable_count": len(candidates),
+            "first_formats": [
+                {
+                    "format_id": f.get("format_id"),
+                    "ext": f.get("ext"),
+                    "height": f.get("height"),
+                    "vcodec": f.get("vcodec"),
+                    "acodec": f.get("acodec"),
+                    "protocol": f.get("protocol"),
+                }
+                for f in formats[:8]
+            ],
+        })
+
+        if not candidates:
+            return None
+
+        best = candidates[0][1]
+
+        return {
+            "id": video_id,
+            "title": info.get("title") or "",
+            "url": best.get("url"),
+            "format": best.get("format_id") or "",
+            "quality": str(best.get("height") or ""),
+            "source": "yt_dlp",
+            "instance": "youtube",
+            "mode": mode,
+        }
+    except Exception as e:
+        attempts.append({
+            "method": "yt_dlp",
+            "error": str(e),
+        })
+
+    return None
 
 
-def extract_mp4(video_id: str, mode: str = "ps3", force: bool = False) -> dict:
+def auto_extract(video_id: str, mode: str = "ps3", force: bool = False, include_attempts: bool = False) -> dict:
     if not valid_video_id(video_id):
         raise ValueError("ID inválido")
 
     mode = "pc" if mode == "pc" else "ps3"
-    cache_key = f"{video_id}:{mode}:process_false_v3"
+    cache_key = f"auto:{video_id}:{mode}:classic_auto_compat_v1"
 
     if not force:
         cached = cache_get(cache_key)
         if cached:
             cached = dict(cached)
             cached["cache"] = True
+            if not include_attempts:
+                cached.pop("attempts", None)
             return cached
 
-    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    attempts = []
 
-    with yt_dlp.YoutubeDL(yt_dlp_opts(mode)) as ydl:
-        info = ydl.extract_info(watch_url, download=False, process=False)
+    for extractor in (extract_from_invidious_api, extract_from_invidious_watch, extract_from_ytdlp):
+        data = extractor(video_id, mode, attempts)
+        if data and data.get("url"):
+            data["cache"] = False
+            data["created_at"] = int(time.time())
+            data["attempts"] = attempts
+            cache_set(cache_key, data)
 
-    selected, scored = pick_best_progressive_format(info, mode)
+            if not include_attempts:
+                data = dict(data)
+                data.pop("attempts", None)
 
-    if not selected:
-        available = []
-        for f in (info.get("formats") or [])[:80]:
-            available.append({
-                "format_id": f.get("format_id"),
-                "ext": f.get("ext"),
-                "height": f.get("height"),
-                "vcodec": f.get("vcodec"),
-                "acodec": f.get("acodec"),
-                "protocol": f.get("protocol"),
-            })
+            return data
 
-        raise RuntimeError(
-            "Nenhum formato progressivo com vídeo+áudio foi encontrado. "
-            "Abra /formats/%s?mode=%s para ver formatos disponíveis. "
-            "Primeiros formatos: %s" % (video_id, mode, available[:12])
-        )
-
-    media_url = selected.get("url")
-    if not media_url:
-        raise RuntimeError("Formato escolhido não tem URL")
-
-    result = {
-        "id": video_id,
-        "title": info.get("title") or "",
-        "url": media_url,
-        "format": selected.get("format_id") or selected.get("format") or "",
-        "ext": selected.get("ext"),
-        "height": selected.get("height"),
-        "width": selected.get("width"),
-        "vcodec": selected.get("vcodec"),
-        "acodec": selected.get("acodec"),
-        "protocol": selected.get("protocol"),
-        "mode": mode,
-        "duration": info.get("duration"),
-        "thumbnail": info.get("thumbnail"),
-        "cache": False,
-        "created_at": int(time.time()),
-        "available_progressive": [
-            {
-                "score": s,
-                "format_id": f.get("format_id"),
-                "ext": f.get("ext"),
-                "height": f.get("height"),
-                "vcodec": f.get("vcodec"),
-                "acodec": f.get("acodec"),
-                "protocol": f.get("protocol"),
-            }
-            for s, f in scored[:10]
-        ],
-    }
-
-    cache_set(cache_key, result)
-    return result
-
-
-def list_formats_for_debug(video_id: str, mode: str = "ps3") -> dict:
-    if not valid_video_id(video_id):
-        raise ValueError("ID inválido")
-
-    mode = "pc" if mode == "pc" else "ps3"
-    watch_url = f"https://www.youtube.com/watch?v={video_id}"
-
-    with yt_dlp.YoutubeDL(yt_dlp_opts(mode)) as ydl:
-        info = ydl.extract_info(watch_url, download=False, process=False)
-
-    rows = []
-    for f in info.get("formats") or []:
-        rows.append({
-            "score": format_score(f, mode),
-            "format_id": f.get("format_id"),
-            "format_note": f.get("format_note"),
-            "ext": f.get("ext"),
-            "width": f.get("width"),
-            "height": f.get("height"),
-            "fps": f.get("fps"),
-            "vcodec": f.get("vcodec"),
-            "acodec": f.get("acodec"),
-            "protocol": f.get("protocol"),
-            "filesize": f.get("filesize") or f.get("filesize_approx"),
-            "has_url": bool(f.get("url")),
-        })
-
-    rows.sort(key=lambda x: x["score"], reverse=True)
-
-    return {
-        "id": video_id,
-        "title": info.get("title") or "",
-        "mode": mode,
-        "formats_count": len(rows),
-        "best_candidates": rows[:40],
-    }
+    raise RuntimeError("Nenhum MP4 automático encontrado. Tentativas: " + str(attempts[-10:]))
 
 
 @app.get("/")
 def index():
-    return Response(
-        f"""<!doctype html>
+    return Response(f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>yt-dlp External Extractor</title>
+  <title>Classic Auto YouTube Extractor</title>
   <style>
     body{{background:#111124;color:#fff;font-family:Arial;padding:34px;text-align:center}}
-    .box{{max-width:760px;margin:20px auto;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:22px}}
+    .box{{max-width:820px;margin:20px auto;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:22px}}
     input,select{{padding:12px;border-radius:8px;border:1px solid #444;background:#000;color:#fff}}
     button,a{{display:inline-block;padding:12px 18px;border-radius:8px;background:#2c7dff;color:white;text-decoration:none;border:0;margin:8px;cursor:pointer}}
     .red{{background:#e32929}} .green{{background:#28a745}} .gray{{background:#555}}
@@ -353,33 +502,38 @@ def index():
   </style>
 </head>
 <body>
-  <h1>yt-dlp External Extractor</h1>\n  <p>Version: process_false_v3_2026_06_18</p>
+  <h1>Classic Auto YouTube Extractor</h1>
+  <p>Version: {APP_VERSION}</p>
+
   <div class="box">
-    <form action="/direct" method="get">
+    <form action="/watch" method="get">
       <input name="v" value="7H6swK9OHC0" maxlength="11" placeholder="YouTube ID">
+      <input type="hidden" name="direct" value="1">
       <select name="mode">
         <option value="ps3">PS3 360p/itag18</option>
         <option value="pc">PC 720p/itag22</option>
       </select>
       <button class="red" type="submit">Direto PC</button>
     </form>
+
     <form action="/player" method="get">
       <input name="v" value="7H6swK9OHC0" maxlength="11" placeholder="YouTube ID">
       <button class="green" type="submit">PS3 Flash</button>
     </form>
+
     <p><a class="gray" href="/health">Health</a></p>
   </div>
+
   <div class="box">
-    <p>Endpoints:</p>
-    <p><code>/extract/7H6swK9OHC0?mode=ps3</code></p>\n    <p><code>/formats/7H6swK9OHC0?mode=ps3</code></p>\n    <p><code>/raw/7H6swK9OHC0?mode=ps3</code></p>\n    <p><code>/version</code></p>
-    <p><code>/direct?v=7H6swK9OHC0&mode=pc</code></p>
-    <p><code>/proxy?v=7H6swK9OHC0&mode=ps3</code></p>
+    <p>Endpoints compatíveis com sua loja:</p>
+    <p><code>/video/7H6swK9OHC0.mp4</code></p>
+    <p><code>/watch?v=7H6swK9OHC0&direct=1</code></p>
+    <p><code>/extract/7H6swK9OHC0?mode=ps3</code></p>
+    <p><code>/debug?v=7H6swK9OHC0&mode=ps3</code></p>
     <p><code>/player?v=7H6swK9OHC0</code></p>
   </div>
 </body>
-</html>""",
-        mimetype="text/html",
-    )
+</html>""", mimetype="text/html")
 
 
 @app.get("/health")
@@ -389,13 +543,13 @@ def health():
         os.environ.get("YTDLP_COOKIES_B64") or
         os.environ.get("YTDLP_COOKIES_RAW")
     )
-
     return jsonify({
         "ok": True,
-        "service": "yt-dlp-extractor",
+        "service": "classic-auto-extractor",
         "version": APP_VERSION,
         "cache_items": len(CACHE),
-        "has_cookies": has_cookies
+        "has_cookies": has_cookies,
+        "instances": get_instances(),
     })
 
 
@@ -408,73 +562,50 @@ def version():
 def extract_route(video_id):
     mode = request.args.get("mode", "ps3")
     force = request.args.get("force") == "1"
-
     try:
-        return jsonify(extract_mp4(video_id, mode=mode, force=force))
+        data = auto_extract(video_id, mode=mode, force=force, include_attempts=False)
+        return jsonify(data)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "id": video_id}), 500
 
 
-@app.get("/formats/<video_id>")
-def formats_route(video_id):
+@app.get("/debug")
+def debug_route():
+    video_id = request.args.get("v", "")
     mode = request.args.get("mode", "ps3")
+    force = request.args.get("force") == "1"
 
     try:
-        return jsonify(list_formats_for_debug(video_id, mode=mode))
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "id": video_id}), 500
-
-
-
-
-@app.get("/raw/<video_id>")
-def raw_route(video_id):
-    mode = request.args.get("mode", "ps3")
-
-    try:
-        if not valid_video_id(video_id):
-            raise ValueError("ID inválido")
-
-        mode = "pc" if mode == "pc" else "ps3"
-        watch_url = f"https://www.youtube.com/watch?v={video_id}"
-
-        with yt_dlp.YoutubeDL(yt_dlp_opts(mode)) as ydl:
-            info = ydl.extract_info(watch_url, download=False, process=False)
-
-        formats = info.get("formats") or []
-        return jsonify({
-            "ok": True,
-            "version": APP_VERSION,
-            "id": video_id,
-            "title": info.get("title") or "",
-            "formats_count": len(formats),
-            "top_keys": sorted(list(info.keys()))[:80],
-            "first_formats": [
-                {
-                    "format_id": f.get("format_id"),
-                    "ext": f.get("ext"),
-                    "height": f.get("height"),
-                    "vcodec": f.get("vcodec"),
-                    "acodec": f.get("acodec"),
-                    "protocol": f.get("protocol"),
-                    "has_url": bool(f.get("url")),
-                }
-                for f in formats[:25]
-            ]
-        })
+        data = auto_extract(video_id, mode=mode, force=force, include_attempts=True)
+        return jsonify({"ok": True, "result": data, "attempts": data.get("attempts", [])})
     except Exception as e:
         return jsonify({"ok": False, "version": APP_VERSION, "error": str(e), "id": video_id}), 500
 
-@app.get("/direct")
-def direct_route():
+
+@app.get("/watch")
+def watch_route():
     video_id = request.args.get("v", "")
     mode = request.args.get("mode", "ps3")
+    direct = request.args.get("direct") == "1"
 
     try:
-        data = extract_mp4(video_id, mode=mode)
-        return redirect(data["url"], code=302)
+        data = auto_extract(video_id, mode=mode, force=False, include_attempts=False)
+        if direct:
+            return redirect(data["url"], code=302)
+        return proxy_url(data["url"])
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "id": video_id}), 500
+
+
+@app.route("/video/<video_id>.mp4", methods=["GET", "HEAD"])
+def classic_video_route(video_id):
+    # ESTE é o endpoint que o seu classic já chama:
+    # YOUTUBE_PS3_WORKER + '/video/' + videoId + '.mp4'
+    try:
+        data = auto_extract(video_id, mode="ps3", force=False, include_attempts=False)
+        return proxy_url(data["url"])
+    except Exception as e:
+        return Response("Video extraction failed: " + str(e), status=500, mimetype="text/plain")
 
 
 @app.route("/proxy", methods=["GET", "HEAD"])
@@ -483,7 +614,7 @@ def proxy_route():
     mode = request.args.get("mode", "ps3")
 
     try:
-        data = extract_mp4(video_id, mode=mode)
+        data = auto_extract(video_id, mode=mode, force=False, include_attempts=False)
         return proxy_url(data["url"])
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "id": video_id}), 500
@@ -495,8 +626,8 @@ def player_route():
     if not valid_video_id(video_id):
         return Response("ID inválido", status=400)
 
-    proxy_url = f"/proxy?v={quote(video_id)}&mode=ps3"
-    return Response(FLASH_PLAYER_HTML(proxy_url, video_id), mimetype="text/html")
+    video_url = f"/video/{quote(video_id)}.mp4"
+    return Response(FLASH_PLAYER_HTML(video_url, video_id), mimetype="text/html")
 
 
 def proxy_url(media_url: str):
@@ -551,12 +682,12 @@ def proxy_url(media_url: str):
     return Response(generate(), status=upstream.status_code, headers=response_headers)
 
 
-def FLASH_PLAYER_HTML(proxy_url: str, video_id: str) -> str:
+def FLASH_PLAYER_HTML(video_url: str, video_id: str) -> str:
     return f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>PS3 yt-dlp Player</title>
+  <title>PS3 Trailer</title>
 </head>
 <body style="background:#000;color:#fff;text-align:center;margin:0;padding-top:40px;font-family:Arial;">
   <script type="text/javascript" src="https://github.com/PS3-Pro/Pages/raw/main/resources/scripts/flash_objects.js"></script>
@@ -569,14 +700,14 @@ def FLASH_PLAYER_HTML(proxy_url: str, video_id: str) -> str:
         bgcolor: "#000000",
         allowScriptAccess: "always",
         allowFullScreen: "true",
-        flashvars: "fichier={proxy_url}&auto_play=true&apercu=https://ps3-pro.github.io/Pages/resources/media/visualizer_preview.png"
+        flashvars: "fichier={video_url}&auto_play=true&apercu=https://ps3-pro.github.io/Pages/resources/media/visualizer_preview.png"
       }};
       var attributes_936 = {{}};
       flashObject(
-        "https://github.com/PS3-Pro/Pages/raw/main/resources/swf/video_player/video_player_28.swf",
+        "https://github.com/PS3-Pro/Pages/raw/main/resources/swf/video_player/video_player_27.swf",
         "player_936",
-        "1080",
-        "660",
+        "960",
+        "540",
         "8",
         false,
         flashvars_936,
@@ -585,7 +716,7 @@ def FLASH_PLAYER_HTML(proxy_url: str, video_id: str) -> str:
       );
     </script>
   </div>
-  <p style="font-size:12px;color:#888;word-break:break-all;">{proxy_url}</p>
+  <p style="font-size:12px;color:#888;word-break:break-all;">{video_url}</p>
 </body>
 </html>"""
 
