@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import time
@@ -44,6 +45,46 @@ def cache_set(key: str, data: dict):
     }
 
 
+def ensure_cookiefile_from_env():
+    """
+    Railway não é bom para subir arquivo cookies.txt manual.
+    Então aceitamos:
+    - YTDLP_COOKIES_FILE: caminho para arquivo já existente
+    - YTDLP_COOKIES_B64: cookies.txt em base64
+    - YTDLP_COOKIES_RAW: conteúdo bruto do cookies.txt
+    """
+    cookiefile = os.environ.get("YTDLP_COOKIES_FILE")
+    if cookiefile and os.path.exists(cookiefile):
+        return cookiefile
+
+    b64 = os.environ.get("YTDLP_COOKIES_B64")
+    raw = os.environ.get("YTDLP_COOKIES_RAW")
+
+    if not b64 and not raw:
+        return None
+
+    target = "/tmp/youtube_cookies.txt"
+
+    if b64:
+        try:
+            content = base64.b64decode(b64).decode("utf-8", errors="replace")
+        except Exception as e:
+            raise RuntimeError(f"YTDLP_COOKIES_B64 inválido: {e}")
+    else:
+        content = raw.replace("\\n", "\n")
+
+    if "# Netscape HTTP Cookie File" not in content:
+        # yt-dlp espera formato Netscape cookies.txt.
+        # Não bloqueia, mas avisa pelo erro do yt-dlp se estiver errado.
+        pass
+
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    os.chmod(target, 0o600)
+    return target
+
+
 def yt_dlp_opts(mode: str = "ps3") -> dict:
     # PS3/Flash gosta de MP4 progressivo com vídeo+áudio juntos.
     # itag 18 = 360p MP4 H.264 + AAC, geralmente o mais compatível.
@@ -66,10 +107,10 @@ def yt_dlp_opts(mode: str = "ps3") -> dict:
         },
     }
 
-    # Opcional: se você montar cookies.txt no servidor.
-    # Útil quando o YouTube exige login/captcha/PO token em alguns casos.
-    cookiefile = os.environ.get("YTDLP_COOKIES_FILE")
-    if cookiefile and os.path.exists(cookiefile):
+    # Cookies opcionais.
+    # Útil quando o YouTube exige: "Sign in to confirm you're not a bot".
+    cookiefile = ensure_cookiefile_from_env()
+    if cookiefile:
         opts["cookiefile"] = cookiefile
 
     return opts
@@ -204,7 +245,18 @@ def index():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "service": "yt-dlp-extractor", "cache_items": len(CACHE)})
+    has_cookies = bool(
+        os.environ.get("YTDLP_COOKIES_FILE") or
+        os.environ.get("YTDLP_COOKIES_B64") or
+        os.environ.get("YTDLP_COOKIES_RAW")
+    )
+
+    return jsonify({
+        "ok": True,
+        "service": "yt-dlp-extractor",
+        "cache_items": len(CACHE),
+        "has_cookies": has_cookies
+    })
 
 
 @app.get("/extract/<video_id>")

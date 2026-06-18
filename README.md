@@ -41,3 +41,51 @@ Use apenas com vídeos seus, conteúdo livre, ou conteúdo que você tem direito
 - Render Free pode dormir após inatividade; a primeira chamada pode demorar.
 - Railway não tem plano grátis permanente; Hobby tem mínimo mensal.
 - YouTube pode exigir PO Token/cookies em alguns casos. Este projeto não burla isso; só usa yt-dlp normalmente.
+
+
+## Fix Railway mise Python attestations
+
+Se o build falhar com:
+
+`No GitHub artifact attestations found for python@3.11.9`
+
+No Railway > Variables, adicione:
+
+`MISE_PYTHON_GITHUB_ATTESTATIONS=false`
+
+Este ZIP também inclui `mise.toml`:
+
+```toml
+[settings]
+python.github_attestations = false
+```
+
+Depois faça Redeploy.
+
+
+## YouTube pedindo "Sign in to confirm you're not a bot"
+
+Se `/extract/ID` retornar erro pedindo cookies, use variável de ambiente no Railway.
+
+### Variável recomendada
+
+No Railway > Variables:
+
+`YTDLP_COOKIES_B64=<seu cookies.txt em base64>`
+
+O app vai escrever isso em `/tmp/youtube_cookies.txt` e passar para o yt-dlp.
+
+### Como gerar base64 no Windows PowerShell
+
+Com `cookies.txt` na pasta atual:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt")) | Set-Clipboard
+```
+
+Depois cole no Railway como valor de `YTDLP_COOKIES_B64`.
+
+### Segurança
+
+Cookies equivalem a sessão/login. Use conta secundária do YouTube/Google, não a principal.
+Não poste cookies em chat, print, GitHub ou logs.
